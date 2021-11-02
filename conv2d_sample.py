@@ -1,22 +1,43 @@
+# !/usr/bin/env python3
+# _*_ coding:utf-8 _*_
+"""
+@File     : conv2d_sample.py
+@Project  : PyTorch
+@Time     : 2021/10/25 17:48
+@Author   : aaron-wu
+@Contact_1: no5aaron@163.com
+@Contact_2: wuhao@insta360.com
+@Software : PyCharm
+@Last Modify Time      @Version     @Desciption
+--------------------       --------        -----------
+2021/10/25 17:48        1.0             None
+"""
 import torch
-import torch.nn as nn
-from torch.autograd import Variable
 
-x = torch.FloatTensor([0.1, 1, 10, 100, 1000, 10000]).view(1, -1, 1, 1)
-x = Variable(x)
+class Conv2dModel(torch.nn.Module):
+    def __init__(self):
+        super(Conv2dModel, self).__init__()
+        self.conv2d = torch.nn.Conv2d(1, 1, kernel_size=(3, 3))
 
-conv = nn.Conv2d(in_channels=6,
-                 out_channels=6,
-                 kernel_size=1,
-                 stride=1,
-                 padding=0,
-                 groups=3,
-                 bias=False)
+    def forward(self, x):
+        y = self.conv2d(x)
+        return y
 
-print(conv.weight.data.size())
-conv.weight.data = torch.arange(1, 13, dtype=torch.float32).view(6, 2, 1, 1)
+def inference(dummy_input, model):
+    output = model(dummy_input)
+    print(output)
 
-print(conv.weight.data)
 
-output = conv(x)
-print(output)
+if __name__ == '__main__':
+    net = Conv2dModel()
+    N = 1
+    C = 1
+    H = 8
+    W = 8
+    dummy_input = torch.randn(N, C, H, W)
+
+    #
+    inference(dummy_input, net)
+    model_name = './conv2dModel.onnx'
+    torch.onnx.export(net, dummy_input, model_name, input_names=["input"], output_names=["output"])
+
