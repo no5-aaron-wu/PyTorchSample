@@ -21,54 +21,116 @@ from torch.autograd import Function
 torch.set_printoptions(precision=4, sci_mode=False)
 
 
-def reference_roi_pool(feats, rois, output_size=[7, 7], spatial_scale=1 / 16, sampling_ratio=-1, pool_mode=0,
-                       aligned=False):
-    x1 = rois[0][1] * spatial_scale
-    y1 = rois[0][2] * spatial_scale
-    x2 = rois[0][3] * spatial_scale
-    y2 = rois[0][4] * spatial_scale
+class PreCalc:
+    def __init__(self, pos=[0, 0, 0, 0], w=[0, 0, 0, 0]):
+        self.pos = pos
+        self.w = w
 
-    roi_width = max((x2 - x1), 1)
-    roi_height = max((y2 - y1), 1)
 
-    bin_size_w = roi_width / output_size[1]
-    bin_size_h = roi_height / output_size[0]
+def pre_calc_for_bilinear_interpolate(height, width, pooled_height, pooled_width, roi_start_h, roi_start_w, bin_size_h,
+                                      bin_size_w, sampling_ratio_h, sampling_ratio_w):
+    pre_calc = []
 
-    output = torch.zeros(output_size)
+    sampling_bin_h = bin_size_h / sampling_ratio_h
+    sampling_bin_w = bin_size_w / sampling_ratio_w
 
-    sampling_ratio_w = sampling_ratio if sampling_ratio > 0 else math.ceil(roi_width / output_size[1])
-    sampling_ratio_h = sampling_ratio if sampling_ratio > 0 else math.ceil(roi_height / output_size[0])
+    for h in range(pooled_height):
+        sampling_start_h = roi_start_h + h * bin_size_h
+        for w in range(pooled_width):
+            sampling_start_w = roi_start_w + w * bin_size_w
+            for i in range(sampling_ratio_h):
+                py = sampling_start_h + (0.5 + i) * sampling_bin_h
+                for j in range(sampling_ratio_w):
+                    px = sampling_start_w + (0.5 + j) * sampling_bin_w
+                    if py < -1.0 or py > height or px < -1.0 or px > width:
+                        pc = PreCalc()
+                        pre_calc.append(pc)
+                        continue
 
-    for h in range(output_size[0]):
-        for w in range(output_size[1]):
-            res = torch.zeros((sampling_ratio_w, sampling_ratio_h))
-            for i in range(sampling_ratio_w):
-                for j in range(sampling_ratio_h):
-                    point_x = x1 + w * bin_size_w + (bin_size_w * (1 + 2 * i) / (2 * sampling_ratio_w))
-                    point_y = y1 + h * bin_size_h + (bin_size_h * (1 + 2 * j) / (2 * sampling_ratio_h))
-                    if aligned:
-                        point_x = max(point_x - 0.5, 0)
-                        point_y = max(point_y - 0.5, 0)
+                    if py < 0:
+                        py = 0
+                    if px < 0:
+                        px = 0
 
-                    val0 = feats[0][0][int(point_y)][int(point_x)]
-                    val1 = feats[0][0][int(point_y)][int(point_x) + 1]
-                    val2 = feats[0][0][int(point_y) + 1][int(point_x)]
-                    val3 = feats[0][0][int(point_y) + 1][int(point_x) + 1]
+                    py0 = int(py)
+                    px0 = int(px)
+                    py1 = py0 + 1
+                    px1 = px0 + 1
 
-                    dx0 = point_x - int(point_x)
-                    dx1 = int(point_x) + 1 - point_x
-                    dy0 = point_y - int(point_y)
-                    dy1 = int(point_y) + 1 - point_y
+                    if py0 >= height - 1:
+                        py0 = py1 = height - 1
+                        py = float(py0)
+                    if px0 >= width - 1:
+                        px0 = px1 = width - 1
+                        px = float(px0)
 
+                    dy0 = py - py0
+                    dx0 = px - px0
+                    dy1 = 1. - dy0
+                    dx1 = 1. - dx0
                     area0 = dx0 * dy0
                     area1 = dx1 * dy0
                     area2 = dx0 * dy1
                     area3 = dx1 * dy1
-                    res[i][j] = val0 * area3 + val1 * area2 + val2 * area1 + val3 * area0
-            if pool_mode == 0:  # ave pool
-                output[h][w] = torch.mean(res)
-            elif pool_mode == 1:  # max pool
-                output[h][w] = torch.max(res)
+                    pos0 = py0 * width + px0
+                    pos1 = py0 * width + px1
+                    pos2 = py1 * width + px0
+                    pos3 = py1 * width + px1
+                    pc = PreCalc(pos=[pos0, pos1, pos2, pos3], w=[area3, area2, area1, area0])
+                    pre_calc.append(pc)
+    return pre_calc
+
+
+def reference_roi_align(feats, rois, output_size=[7, 7], spatial_scale=1 / 16, sampling_ratio=-1, pool_mode=0,
+                        aligned=False):
+    num_roi = rois.size()[0]
+    channel = feats.size()[1]
+    input_h = feats.size()[2]
+    input_w = feats.size()[3]
+    output = torch.zeros((num_roi, channel, output_size[0], output_size[1]))
+
+    offset = -0.5 if aligned else 0.0
+    for n in range(num_roi):
+        batch_index = int(rois[n][0])
+        x1 = rois[n][1].item() * spatial_scale + offset
+        y1 = rois[n][2].item() * spatial_scale + offset
+        x2 = rois[n][3].item() * spatial_scale + offset
+        y2 = rois[n][4].item() * spatial_scale + offset
+
+        roi_width = x2 - x1
+        roi_height = y2 - y1
+        if not aligned:
+            roi_width = max(roi_width, 1.)
+            roi_height = max(roi_height, 1.)
+
+        bin_size_w = roi_width / output_size[1]
+        bin_size_h = roi_height / output_size[0]
+
+        sampling_ratio_w = sampling_ratio if sampling_ratio > 0 else math.ceil(roi_width / output_size[1])
+        sampling_ratio_h = sampling_ratio if sampling_ratio > 0 else math.ceil(roi_height / output_size[0])
+
+        pre_calc = pre_calc_for_bilinear_interpolate(input_h, input_w, output_size[0], output_size[1], y1, x1,
+                                                     bin_size_h, bin_size_w, sampling_ratio_h, sampling_ratio_w)
+
+        for c in range(channel):
+            pre_calc_index = 0
+            for h in range(output_size[0]):
+                for w in range(output_size[1]):
+                    res = torch.zeros((sampling_ratio_h, sampling_ratio_w))
+                    for i in range(sampling_ratio_h):
+                        for j in range(sampling_ratio_w):
+                            pc = pre_calc[pre_calc_index]
+                            val0 = feats[batch_index][c][pc.pos[0] // input_w][pc.pos[0] % input_w]
+                            val1 = feats[batch_index][c][pc.pos[1] // input_w][pc.pos[1] % input_w]
+                            val2 = feats[batch_index][c][pc.pos[2] // input_w][pc.pos[2] % input_w]
+                            val3 = feats[batch_index][c][pc.pos[3] // input_w][pc.pos[3] % input_w]
+
+                            res[i][j] = val0 * pc.w[0] + val1 * pc.w[1] + val2 * pc.w[2] + val3 * pc.w[3]
+                            pre_calc_index += 1
+                    if pool_mode == 0:  # ave pool
+                        output[n][c][h][w] = torch.mean(res)
+                    elif pool_mode == 1:  # max pool
+                        output[n][c][h][w] = torch.max(res)
 
     return output
 
@@ -106,37 +168,53 @@ class RoiAlignModel(torch.nn.Module):
 
 if __name__ == '__main__':
     N = 1
-    C = 1
-    H = 16
-    W = 16
+    C = 256
+    H = 25
+    W = 25
     spatial_scale = 1 / 16
     kernel_size = 7
     pool_mode = 0
     sampling_ratio = 2
-    aligned = True#False
+    # aligned = True
+    aligned = False
 
     feature_maps = torch.randn(N, C, H, W)
+    # feature_maps = torch.Tensor()
     print(feature_maps)
 
-    rois_in_feature = torch.Tensor([0, 5, 10, 10, 15])
-    rois_in_feature = rois_in_feature.unsqueeze(0)
+    # rois_in_feature = torch.Tensor([[0, 0, 1, 2, 3], [2, 0.5, 1, 1.5, 2]])
+    # rois_in_feature = torch.Tensor([[0, 3.1, 7, 1, 3]])
+    # rois_in_feature = rois_in_feature.unsqueeze(0)
 
-    rois_in_image = rois_in_feature / spatial_scale
-    ref_output = reference_roi_pool(feature_maps, rois_in_image, output_size=[kernel_size, kernel_size],
-                                    spatial_scale=spatial_scale,
-                                    pool_mode=pool_mode, sampling_ratio=sampling_ratio, aligned=aligned)
+    roi_nums = 50
+    rois_in_feature = torch.normal(mean=(H + W) / 4, std=(H + W) / 8, size=(roi_nums, 4))
+    rois_batch_index = torch.linspace(0, N - 1, steps=roi_nums).unsqueeze(1)
+    rois_batch_index = rois_batch_index.floor()
+    rois_in_feature = torch.cat([rois_batch_index, rois_in_feature], dim=1)
+
+    print(rois_in_feature)
+
+    rois_in_image = torch.clone(rois_in_feature)
+    rois_in_image[:, 1:] /= spatial_scale
+
+    ref_output = reference_roi_align(feature_maps, rois_in_image, output_size=[kernel_size, kernel_size],
+                                     spatial_scale=spatial_scale,
+                                     pool_mode=pool_mode, sampling_ratio=sampling_ratio, aligned=aligned)
     print(ref_output)
 
-    # torch_output = roi_align(feature_maps, rois_in_image, output_size=(kernel_size, kernel_size), spatial_scale=spatial_scale,
+    # torch_output = roi_align(feature_maps, rois_in_image, output_size=(kernel_size, kernel_size),
+    #                          spatial_scale=spatial_scale,
     #                          sampling_ratio=sampling_ratio, aligned=aligned)
     # print(torch_output)
-    # net = RoiAlignModel(kernel_size, spatial_scale, sampling_ratio=sampling_ratio, aligned=aligned)
     net = RoiAlignModel(kernel_size, spatial_scale, sampling_ratio=sampling_ratio, aligned=aligned)
     torch_output = net(feature_maps, rois_in_image)
     print(torch_output)
 
+    print(torch.isclose(ref_output, torch_output))
+    print(torch.isclose(ref_output, torch_output, atol=1e-03).all())
+
     # export
-    model_name = './ROIAlignModel.onnx'
+    model_name = './ROIAlignModel_1x256x25x25_50_1d16_k7p0s2a0.onnx'
     torch.onnx.export(net, (feature_maps, rois_in_image), model_name, input_names=['feats', 'rois'],
                       output_names=['output'])
 

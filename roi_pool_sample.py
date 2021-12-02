@@ -22,36 +22,41 @@ import torchvision
 from tensorflow.keras.preprocessing.image import load_img
 import torchvision.transforms as T
 
-
 torch.set_printoptions(precision=4, sci_mode=False)
 
 model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
 model.eval()
 
 
-def self_roi_pool(feats, rois):
+def reference_roi_pool(feats, rois, output_size=[7, 7], spatial_scale=1 / 16):
     # self 计算
-    rois = rois.squeeze(0).squeeze(0)
-    roi_start_w = int(rois[0][1] + 0.5)
-    roi_start_h = int(rois[0][2] + 0.5)
-    roi_end_w = int(rois[0][3] + 0.5)
-    roi_end_h = int(rois[0][4] + 0.5)
+    num_roi = rois.size()[0]
+    channel = feats.size()[1]
+    output = torch.zeros((num_roi, channel, output_size[0], output_size[1]))
+    for n in range(num_roi):
+        batch_index = int(rois[n][0])
+        roi_start_w = int(rois[n][1] + 0.5)
+        roi_start_h = int(rois[n][2] + 0.5)
+        roi_end_w = int(rois[n][3] + 0.5)
+        roi_end_h = int(rois[n][4] + 0.5)
 
-    roi_width = (roi_end_w - roi_start_w + 1)
-    roi_height = (roi_end_h - roi_start_h + 1)
+        roi_width = max((roi_end_w - roi_start_w + 1), 1)
+        roi_height = max((roi_end_h - roi_start_h + 1), 1)
 
-    bin_size_w = roi_width / 7
-    bin_size_h = roi_height / 7
+        bin_size_w = roi_width / output_size[1]
+        bin_size_h = roi_height / output_size[0]
 
-    self_result = torch.zeros((7, 7))
-    for j in range(7):
-        for i in range(7):
-            self_result[j][i] = (feats[...,
-                                 int(roi_start_h + bin_size_h * j):math.ceil(roi_start_h + bin_size_h * (j + 1)),
-                                 int(roi_start_w + bin_size_w * i):math.ceil(roi_start_w + bin_size_w * (i + 1))][0][
-                                     0].max().item())
-    print(self_result)
-    pass
+        for c in range(channel):
+            for j in range(output_size[0]):
+                for i in range(output_size[1]):
+                    output[n][c][j][i] = (feats[...,
+                                          int(roi_start_h + bin_size_h * j):math.ceil(
+                                              roi_start_h + bin_size_h * (j + 1)),
+                                          int(roi_start_w + bin_size_w * i):math.ceil(
+                                              roi_start_w + bin_size_w * (i + 1))][
+                                              batch_index][
+                                              c].max())
+    return output
 
 
 class RoiPoolFunc(Function):
@@ -77,14 +82,14 @@ class RoIPoolModel(torch.nn.Module):
         self.roi_pool = roi_pool
 
     def forward(self, feats, rois):
-        rois = rois.squeeze(0).squeeze(0)
         r = self.roi_pool(feats, rois, self.output_size, self.spacial_scale)
         return r
+
 
 class RoIPoolWithRPNModel(torch.nn.Module):
     def __init__(self, img_height=800, img_width=800, kernel_size=7):
         super(RoIPoolWithRPNModel, self).__init__()
-        self.targets=None
+        self.targets = None
         self.transform = model.transform
         self.backbone = model.backbone
         self.model_rpn = model.rpn
@@ -93,8 +98,9 @@ class RoIPoolWithRPNModel(torch.nn.Module):
         self.img_height = img_height
         self.img_width = img_width
         self.output_size = [kernel_size, kernel_size]
-        self.spatial_scale = 1/16
+        self.spatial_scale = 1 / 16
         pass
+
     def forward(self, images):
         images, self.targets = self.transform(images, self.targets)
         features = self.backbone(images.tensors)
@@ -112,28 +118,31 @@ class RoIPoolWithRPNModel(torch.nn.Module):
         pass
 
 
-def inference(feats, rois, model):
-    output = model(feats, rois)
-    print(output)
-
 def case1():
-    N = 1
-    C = 1
-    H = 16
-    W = 16
+    N = 3
+    C = 8
+    H = 4
+    W = 4
+    spatial_scale = 1 / 16
+    kernel_size = 3
+
     feature_maps = torch.randn(N, C, H, W)
-    print("========================")
     print(feature_maps)
-    rois_in_feature = torch.Tensor([0, 5, 10, 10, 15])
-    # rois_in_feature = rois_in_feature.unsqueeze(0)
-    rois_in_feature = rois_in_feature.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-    inv_spatial_scale = 16
-    rois_in_image = rois_in_feature * inv_spatial_scale
+    rois_in_feature = torch.Tensor([2, 1, 2, 3, 3])
+    rois_in_feature = rois_in_feature.unsqueeze(0)
+    # rois_in_feature = rois_in_feature.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+    rois_in_image = torch.clone(rois_in_feature)
+    rois_in_image[:, 1:] /= spatial_scale
 
-    self_roi_pool(feature_maps, rois_in_feature)
+    ref_output = reference_roi_pool(feature_maps, rois_in_feature, output_size=[kernel_size, kernel_size],
+                                    spatial_scale=spatial_scale)
+    print(ref_output)
 
-    net = RoIPoolModel()
-    inference(feature_maps, rois_in_image, net)
+    net = RoIPoolModel(kernel_size=kernel_size, spatial_scale=spatial_scale)
+    torch_output = net(feature_maps, rois_in_image)
+    print(torch_output)
+
+    print(torch.isclose(ref_output, torch_output).all())
 
     # export
     model_name = './SqueezeROIPoolingModel.onnx'
@@ -147,6 +156,8 @@ def case1():
     # outputs = ['output']
     # result = sess.run(outputs, {'feats': feature_maps, 'rois': rois_in_image})
     pass
+
+
 def case2():
     img = load_img('2007_000032.jpg', target_size=(800, 800))
     transform = T.Compose([T.ToTensor()])
@@ -161,15 +172,13 @@ def case2():
     torch.onnx.export(net, images, model_name,
                       input_names=['images'], output_names=['output'], opset_version=11)
 
-
-
     pass
+
 
 if __name__ == '__main__':
     # case 1
-    # case1()
+    case1()
     # case 2
-    case2()
-
+    # case2()
 
     pass
