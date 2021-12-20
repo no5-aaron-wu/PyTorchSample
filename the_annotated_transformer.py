@@ -1,7 +1,7 @@
 # !/usr/bin/env python3
 # _*_ coding:utf-8 _*_
 """
-@File     : transformer_sample.py
+@File     : the_annotated_transformer.py
 @Project  : PyTorchSample
 @Time     : 2021/12/14 16:03
 @Author   : aaron-wu
