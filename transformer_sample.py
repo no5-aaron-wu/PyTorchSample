@@ -389,7 +389,9 @@ class LabelSmoothing(nn.Module):
 def data_gen(V, batch, nbatches):
     "Generate random data for a src-tgt copy task."
     for i in range(nbatches):
-        data = torch.from_numpy(np.random.randint(1, V, size=(batch, 10)))
+        np_data = np.random.randint(1, V, size=(batch, 10))
+        data = torch.LongTensor(np_data)
+        # data = torch.from_numpy(np.random.randint(1, V, size=(batch, 10)))
         data[:, 0] = 1
         src = Variable(data, requires_grad=False)
         tgt = Variable(data, requires_grad=False)
@@ -412,7 +414,8 @@ class SimpleLossCompute:
         if self.opt is not None:
             self.opt.step()
             self.opt.optimizer.zero_grad()
-        return loss.data[0] * norm
+        # return loss.data[0] * norm
+        return loss.data * norm
 
 
 def greedy_decode(model, src, src_mask, max_len, start_symbol):
